@@ -240,9 +240,10 @@
       <button class="btn primary" id="exportSvg">SVG</button>
     </div>
     <div class="duo">
+      <button class="btn" id="exportMp4">Loop · MP4</button>
       <button class="btn" id="exportMov">Loop · MOV</button>
-      <button class="btn" id="exportZip">Frames · ZIP</button>
     </div>
+    <button class="btn" id="exportZip">Frames · ZIP</button>
     <div class="seed" id="seedLbl"></div>
   </div>
 </aside>
@@ -792,6 +793,11 @@ function atom(type, ...payloads){
   const body = joinBytes(payloads);
   return joinBytes([be32(body.length + 8), str4(type), body]);
 }
+const MATRIX = joinBytes([
+  be32(0x10000), be32(0), be32(0),
+  be32(0), be32(0x10000), be32(0),
+  be32(0), be32(0), be32(0x40000000)
+]);
 function qtHdlr(type, subtype){
   const name = 'INTAGLIO';
   return atom('hdlr', be32(0), str4(type), str4(subtype),
@@ -839,11 +845,7 @@ function buildMov(jpegs, W, H, fps){
   const mdhd = atom('mdhd', be32(0), be32(0), be32(0), be32(timescale), be32(duration), be16(0x55C4), be16(0));
   const mdia = atom('mdia', mdhd, qtHdlr('mhlr','vide'), minf);
 
-  const matrix = joinBytes([
-    be32(0x10000), be32(0), be32(0),
-    be32(0), be32(0x10000), be32(0),
-    be32(0), be32(0), be32(0x40000000)
-  ]);
+  const matrix = MATRIX;
   const tkhd = atom('tkhd', be32(7), be32(0), be32(0), be32(1), be32(0), be32(duration),
                     be32(0), be32(0), be16(0), be16(0), be16(0), be16(0),
                     matrix, be32(W << 16), be32(H << 16));
@@ -854,6 +856,122 @@ function buildMov(jpegs, W, H, fps){
 
   return new Blob([ftyp, mdat, moov], { type:'video/quicktime' });
 }
+
+/* ---------- ISO MP4 muxer (H.264 via WebCodecs) ---------- */
+function isoHdlr(){
+  const name = [...'INTAGLIO'].map(c => c.charCodeAt(0)).concat([0]);
+  return atom('hdlr', be32(0), be32(0), str4('vide'), be32(0), be32(0), be32(0), name);
+}
+function buildMp4(samples, description, W, H, fps){
+  const N = samples.length;
+  const timescale = fps * 1000, delta = 1000, duration = delta * N;
+
+  const ftyp = atom('ftyp', str4('isom'), be32(512), str4('isom'), str4('iso2'), str4('avc1'), str4('mp41'));
+  const mdat = atom('mdat', joinBytes(samples.map(s => s.data)));
+  const firstSampleOffset = ftyp.length + 8;
+
+  const avcC = atom('avcC', description);
+  const entryBody = joinBytes([
+    [0,0,0,0,0,0], be16(1),            /* reserved, data ref index */
+    be16(0), be16(0),                  /* pre_defined, reserved */
+    be32(0), be32(0), be32(0),         /* pre_defined[3] */
+    be16(W), be16(H),
+    be32(0x00480000), be32(0x00480000),
+    be32(0), be16(1),                  /* reserved, frame count */
+    new Uint8Array(32),                /* compressor name */
+    be16(24), be16(0xFFFF),            /* depth, pre_defined */
+    avcC
+  ]);
+  const avc1 = joinBytes([be32(entryBody.length + 8), str4('avc1'), entryBody]);
+  const stsd = atom('stsd', be32(0), be32(1), avc1);
+  const stts = atom('stts', be32(0), be32(1), be32(N), be32(delta));
+  const keys = samples.map((s,i) => s.key ? i+1 : 0).filter(v => v);
+  const stss = atom('stss', be32(0), be32(keys.length), ...keys.map(be32));
+  const stsc = atom('stsc', be32(0), be32(1), be32(1), be32(N), be32(1));
+  const stsz = atom('stsz', be32(0), be32(0), be32(N), ...samples.map(s => be32(s.data.length)));
+  const stco = atom('stco', be32(0), be32(1), be32(firstSampleOffset));
+  const stbl = atom('stbl', stsd, stts, stss, stsc, stsz, stco);
+
+  const vmhd = atom('vmhd', be32(1), be16(0), be16(0), be16(0), be16(0));
+  const dref = atom('dref', be32(0), be32(1), joinBytes([be32(12), str4('url '), be32(1)]));
+  const minf = atom('minf', vmhd, atom('dinf', dref), stbl);
+  const mdhd = atom('mdhd', be32(0), be32(0), be32(0), be32(timescale), be32(duration), be16(0x55C4), be16(0));
+  const mdia = atom('mdia', mdhd, isoHdlr(), minf);
+  const tkhd = atom('tkhd', be32(7), be32(0), be32(0), be32(1), be32(0), be32(duration),
+                    be32(0), be32(0), be16(0), be16(0), be16(0), be16(0),
+                    MATRIX, be32(W << 16), be32(H << 16));
+  const mvhd = atom('mvhd', be32(0), be32(0), be32(0), be32(timescale), be32(duration),
+                    be32(0x00010000), be16(0x0100), new Uint8Array(10),
+                    MATRIX, be32(0), be32(0), be32(0), be32(0), be32(0), be32(0), be32(2));
+  const moov = atom('moov', mvhd, atom('trak', tkhd, mdia));
+
+  return new Blob([ftyp, mdat, moov], { type:'video/mp4' });
+}
+
+/* MP4 — seamless loop (H.264 via the browser's encoder) */
+$('#exportMp4').addEventListener('click', async () => {
+  if(state.tab==='image' && !state.image) return;
+  if(typeof VideoEncoder === 'undefined'){
+    setBusy('MP4 needs a current Chrome / Edge / Safari — MOV works everywhere');
+    await sleep(3000); setBusy(''); return;
+  }
+  let [W,H] = targetSize();
+  W &= ~1; H &= ~1;                      /* H.264 needs even dimensions */
+  const fps = 30, frames = Math.round(state.dur * fps);
+  const oc = document.createElement('canvas'); oc.width = W; oc.height = H;
+
+  const samples = [];
+  let description = null, encError = null;
+  const enc = new VideoEncoder({
+    output: (chunk, meta) => {
+      if(!description && meta && meta.decoderConfig && meta.decoderConfig.description){
+        description = new Uint8Array(meta.decoderConfig.description);
+      }
+      const b = new Uint8Array(chunk.byteLength);
+      chunk.copyTo(b);
+      samples.push({ data:b, key: chunk.type === 'key' });
+    },
+    error: e => { encError = e; }
+  });
+
+  let cfg = null;
+  for(const codec of ['avc1.64002A','avc1.4D402A','avc1.42E02A']){
+    const attempt = { codec, width:W, height:H, bitrate:12000000, framerate:fps,
+                      avc:{ format:'avc' }, latencyMode:'realtime' };
+    try{
+      const s = await VideoEncoder.isConfigSupported(attempt);
+      if(s.supported){ cfg = attempt; break; }
+    }catch(e){}
+  }
+  if(!cfg){
+    setBusy('This browser can\u2019t encode H.264 — use MOV instead');
+    await sleep(3000); setBusy(''); return;
+  }
+  enc.configure(cfg);
+
+  for(let i=0; i<frames; i++){
+    drawFrame(oc, W, H, 1, i/frames);
+    const vf = new VideoFrame(oc, {
+      timestamp: Math.round(i * 1e6 / fps),
+      duration:  Math.round(1e6 / fps)
+    });
+    enc.encode(vf, { keyFrame: i % (fps*2) === 0 });
+    vf.close();
+    setBusy(`Printing loop — frame ${i+1} / ${frames}`);
+    while(enc.encodeQueueSize > 4) await sleep(4);
+    await sleep(0);
+  }
+  await enc.flush();
+  enc.close();
+
+  if(encError || !description || !samples.length){
+    setBusy('Encoding failed — use MOV instead');
+    await sleep(3000); setBusy(''); return;
+  }
+  setBusy('Binding the reel…');
+  downloadBlob(buildMp4(samples, description, W, H, fps), baseName()+'-loop.mp4');
+  setBusy('');
+});
 
 /* MOV — seamless loop */
 $('#exportMov').addEventListener('click', async () => {
